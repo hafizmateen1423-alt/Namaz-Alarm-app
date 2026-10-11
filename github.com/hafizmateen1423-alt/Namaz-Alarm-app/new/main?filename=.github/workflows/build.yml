@@ -1,0 +1,506 @@
+ٹھیک ہے، پورا ٹیکسٹ نیچے ہے۔
+پہلے یہ لنک کھولیں (نام خود بھر جائے گا، ٹائپ نہیں کرنا):
+github.com/hafizmateen1423-alt/Namaz-Alarm-app/new/main?filename=.github/workflows/build.yml
+اگر "file already exists" لکھا آئے تو یہ لنک کھولیں:
+github.com/hafizmateen1423-alt/Namaz-Alarm-app/edit/main/.github/workflows/build.yml
+پھر نیچے کوڈ باکس کے کونے میں Copy بٹن دبائیں، GitHub کے بڑے خالی خانے میں Paste کریں، Commit changes... دبائیں اور "Commit directly to the main branch" منتخب رکھ کر ہرا Commit changes دبائیں۔
+name: Build APK
+
+on:
+  push:
+    branches: ['**']
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: 17
+
+      - name: Set up Gradle
+        uses: gradle/actions/setup-gradle@v4
+        with:
+          gradle-version: 8.9
+
+      - name: Create project files
+        run: |
+          mkdir -p NamazAlarm && cd NamazAlarm
+          mkdir -p app
+          cat > app/build.gradle.kts <<'FILE_END'
+          plugins {
+              id("com.android.application")
+              id("org.jetbrains.kotlin.android")
+          }
+
+          android {
+              namespace = "com.example.namazalarm"
+              compileSdk = 34
+
+              defaultConfig {
+                  applicationId = "com.example.namazalarm"
+                  minSdk = 24
+                  targetSdk = 34
+                  versionCode = 1
+                  versionName = "1.0"
+              }
+
+              compileOptions {
+                  sourceCompatibility = JavaVersion.VERSION_17
+                  targetCompatibility = JavaVersion.VERSION_17
+              }
+              kotlinOptions {
+                  jvmTarget = "17"
+              }
+          }
+
+          dependencies {
+              implementation("androidx.core:core-ktx:1.13.1")
+          }
+          FILE_END
+          mkdir -p app/src/main
+          cat > app/src/main/AndroidManifest.xml <<'FILE_END'
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+              <uses-permission android:name="android.permission.SCHEDULE_EXACT_ALARM" />
+              <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
+              <uses-permission android:name="android.permission.VIBRATE" />
+
+              <application
+                  android:allowBackup="true"
+                  android:label="نماز الارم"
+                  android:supportsRtl="true"
+                  android:theme="@android:style/Theme.Material.Light.NoActionBar">
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+                  <receiver
+                      android:name=".PrayerAlarmReceiver"
+                      android:exported="false" />
+                  <receiver
+                      android:name=".BootReceiver"
+                      android:exported="true">
+                      <intent-filter>
+                          <action android:name="android.intent.action.BOOT_COMPLETED" />
+                          <action android:name="android.intent.action.MY_PACKAGE_REPLACED" />
+                      </intent-filter>
+                  </receiver>
+              </application>
+          </manifest>
+          FILE_END
+          mkdir -p app/src/main/java/com/example/namazalarm
+          cat > app/src/main/java/com/example/namazalarm/AlarmScheduler.kt <<'FILE_END'
+          package com.example.namazalarm
+
+          import android.app.AlarmManager
+          import android.app.PendingIntent
+          import android.content.Context
+          import android.content.Intent
+          import android.os.Build
+          import java.util.Calendar
+          import java.util.Locale
+
+          data class Prayer(val id: Int, val name: String, val defaultMinutes: Int)
+
+          object AlarmScheduler {
+
+              val prayers = listOf(
+                  Prayer(1, "فجر", 5 * 60),
+                  Prayer(2, "ظہر", 13 * 60 + 15),
+                  Prayer(3, "عصر", 16 * 60 + 45),
+                  Prayer(4, "مغرب", 18 * 60 + 30),
+                  Prayer(5, "عشاء", 20 * 60)
+              )
+
+              private fun prefs(c: Context) =
+                  c.getSharedPreferences("namaz_prefs", Context.MODE_PRIVATE)
+
+              fun getMinutes(c: Context, p: Prayer): Int =
+                  prefs(c).getInt("time_${p.id}", p.defaultMinutes)
+
+              fun setMinutes(c: Context, p: Prayer, minutes: Int) {
+                  prefs(c).edit().putInt("time_${p.id}", minutes).apply()
+              }
+
+              fun isEnabled(c: Context, p: Prayer): Boolean =
+                  prefs(c).getBoolean("on_${p.id}", false)
+
+              fun setEnabled(c: Context, p: Prayer, on: Boolean) {
+                  prefs(c).edit().putBoolean("on_${p.id}", on).apply()
+              }
+
+              fun format(minutes: Int): String {
+                  val h = minutes / 60
+                  val m = minutes % 60
+                  val h12 = if (h % 12 == 0) 12 else h % 12
+                  val suffix = if (h < 12) "صبح" else "شام"
+                  return String.format(Locale.US, "%d:%02d %s", h12, m, suffix)
+              }
+
+              private fun pendingIntent(c: Context, p: Prayer): PendingIntent {
+                  val intent = Intent(c, PrayerAlarmReceiver::class.java).putExtra("id", p.id)
+                  return PendingIntent.getBroadcast(
+                      c, p.id, intent,
+                      PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+                  )
+              }
+
+              fun schedule(c: Context, p: Prayer) {
+                  cancel(c, p)
+                  if (!isEnabled(c, p)) return
+
+                  val minutes = getMinutes(c, p)
+                  val cal = Calendar.getInstance().apply {
+                      set(Calendar.HOUR_OF_DAY, minutes / 60)
+                      set(Calendar.MINUTE, minutes % 60)
+                      set(Calendar.SECOND, 0)
+                      set(Calendar.MILLISECOND, 0)
+                  }
+                  if (cal.timeInMillis <= System.currentTimeMillis() + 60_000) {
+                      cal.add(Calendar.DAY_OF_YEAR, 1)
+                  }
+
+                  val am = c.getSystemService(Context.ALARM_SERVICE) as AlarmManager
+                  val pi = pendingIntent(c, p)
+                  try {
+                      if (Build.VERSION.SDK_INT >= 31 && !am.canScheduleExactAlarms()) {
+                          am.setAndAllowWhileIdle(AlarmManager.RTC_WAKEUP, cal.timeInMillis, pi)
+                      } else {
+                          am.setExactAndAllowWhileIdle(AlarmManager.RTC_WAKEUP, cal.timeInMillis, pi)
+                      }
+                  } catch (e: SecurityException) {
+                      am.setAndAllowWhileIdle(AlarmManager.RTC_WAKEUP, cal.timeInMillis, pi)
+                  }
+              }
+
+              fun cancel(c: Context, p: Prayer) {
+                  val am = c.getSystemService(Context.ALARM_SERVICE) as AlarmManager
+                  am.cancel(pendingIntent(c, p))
+              }
+
+              fun scheduleAll(c: Context) {
+                  prayers.forEach { schedule(c, it) }
+              }
+          }
+          FILE_END
+          mkdir -p app/src/main/java/com/example/namazalarm
+          cat > app/src/main/java/com/example/namazalarm/BootReceiver.kt <<'FILE_END'
+          package com.example.namazalarm
+
+          import android.content.BroadcastReceiver
+          import android.content.Context
+          import android.content.Intent
+
+          class BootReceiver : BroadcastReceiver() {
+              override fun onReceive(context: Context, intent: Intent) {
+                  AlarmScheduler.scheduleAll(context)
+              }
+          }
+          FILE_END
+          mkdir -p app/src/main/java/com/example/namazalarm
+          cat > app/src/main/java/com/example/namazalarm/MainActivity.kt <<'FILE_END'
+          package com.example.namazalarm
+
+          import android.Manifest
+          import android.app.Activity
+          import android.app.AlarmManager
+          import android.app.TimePickerDialog
+          import android.content.Context
+          import android.content.Intent
+          import android.content.pm.PackageManager
+          import android.graphics.Color
+          import android.graphics.Typeface
+          import android.graphics.drawable.GradientDrawable
+          import android.net.Uri
+          import android.os.Build
+          import android.os.Bundle
+          import android.provider.Settings
+          import android.view.Gravity
+          import android.view.View
+          import android.view.ViewGroup
+          import android.widget.Button
+          import android.widget.LinearLayout
+          import android.widget.ScrollView
+          import android.widget.Switch
+          import android.widget.TextView
+          import android.widget.Toast
+
+          class MainActivity : Activity() {
+
+              private lateinit var exactButton: Button
+              private val green = Color.parseColor("#1B5E20")
+
+              private fun dp(v: Int) = (v * resources.displayMetrics.density).toInt()
+
+              override fun onCreate(savedInstanceState: Bundle?) {
+                  super.onCreate(savedInstanceState)
+
+                  if (Build.VERSION.SDK_INT >= 33 &&
+                      checkSelfPermission(Manifest.permission.POST_NOTIFICATIONS)
+                      != PackageManager.PERMISSION_GRANTED
+                  ) {
+                      requestPermissions(arrayOf(Manifest.permission.POST_NOTIFICATIONS), 1)
+                  }
+
+                  buildUi()
+              }
+
+              override fun onResume() {
+                  super.onResume()
+                  AlarmScheduler.scheduleAll(this)
+                  val am = getSystemService(Context.ALARM_SERVICE) as AlarmManager
+                  val needsPermission = Build.VERSION.SDK_INT >= 31 && !am.canScheduleExactAlarms()
+                  exactButton.visibility = if (needsPermission) View.VISIBLE else View.GONE
+              }
+
+              private fun buildUi() {
+                  val root = LinearLayout(this).apply {
+                      orientation = LinearLayout.VERTICAL
+                      setPadding(dp(16), dp(36), dp(16), dp(24))
+                  }
+
+                  root.addView(TextView(this).apply {
+                      text = "🕌 نماز الارم"
+                      textSize = 28f
+                      setTypeface(null, Typeface.BOLD)
+                      setTextColor(green)
+                      gravity = Gravity.CENTER
+                  })
+
+                  root.addView(TextView(this).apply {
+                      text = "ہر نماز کا وقت چنیں اور الارم آن کریں"
+                      textSize = 15f
+                      setTextColor(Color.DKGRAY)
+                      gravity = Gravity.CENTER
+                      setPadding(0, dp(6), 0, dp(12))
+                  })
+
+                  exactButton = Button(this).apply {
+                      text = "درست وقت پر الارم کی اجازت دیں"
+                      visibility = View.GONE
+                      setOnClickListener {
+                          if (Build.VERSION.SDK_INT >= 31) {
+                              startActivity(
+                                  Intent(
+                                      Settings.ACTION_REQUEST_SCHEDULE_EXACT_ALARM,
+                                      Uri.parse("package:$packageName")
+                                  )
+                              )
+                          }
+                      }
+                  }
+                  root.addView(exactButton)
+
+                  AlarmScheduler.prayers.forEach { root.addView(buildRow(it)) }
+
+                  root.addView(Button(this).apply {
+                      text = "ٹیسٹ نوٹیفکیشن"
+                      setOnClickListener {
+                          PrayerAlarmReceiver.showNotification(
+                              this@MainActivity, AlarmScheduler.prayers.first()
+                          )
+                          Toast.makeText(this@MainActivity, "ٹیسٹ نوٹیفکیشن بھیج دیا", Toast.LENGTH_SHORT)
+                              .show()
+                      }
+                      layoutParams = LinearLayout.LayoutParams(
+                          ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT
+                      ).apply { topMargin = dp(20) }
+                  })
+
+                  val scroll = ScrollView(this).apply {
+                      setBackgroundColor(Color.parseColor("#F1F8E9"))
+                      isFillViewport = true
+                      addView(root)
+                  }
+                  scroll.layoutDirection = View.LAYOUT_DIRECTION_RTL
+                  setContentView(scroll)
+              }
+
+              private fun buildRow(p: Prayer): View {
+                  val row = LinearLayout(this).apply {
+                      orientation = LinearLayout.HORIZONTAL
+                      gravity = Gravity.CENTER_VERTICAL
+                      setPadding(dp(16), dp(14), dp(16), dp(14))
+                      background = GradientDrawable().apply {
+                          setColor(Color.WHITE)
+                          cornerRadius = dp(16).toFloat()
+                      }
+                      layoutParams = LinearLayout.LayoutParams(
+                          ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT
+                      ).apply { topMargin = dp(12) }
+                  }
+
+                  row.addView(TextView(this).apply {
+                      text = p.name
+                      textSize = 22f
+                      setTypeface(null, Typeface.BOLD)
+                      setTextColor(Color.BLACK)
+                      layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+                  })
+
+                  val timeView = TextView(this).apply {
+                      text = AlarmScheduler.format(AlarmScheduler.getMinutes(this@MainActivity, p))
+                      textSize = 20f
+                      setTextColor(green)
+                      setPadding(dp(12), dp(8), dp(12), dp(8))
+                  }
+                  timeView.setOnClickListener {
+                      val m = AlarmScheduler.getMinutes(this, p)
+                      TimePickerDialog(this, { _, h, min ->
+                          val total = h * 60 + min
+                          AlarmScheduler.setMinutes(this, p, total)
+                          timeView.text = AlarmScheduler.format(total)
+                          AlarmScheduler.schedule(this, p)
+                      }, m / 60, m % 60, false).show()
+                  }
+                  row.addView(timeView)
+
+                  row.addView(Switch(this).apply {
+                      isChecked = AlarmScheduler.isEnabled(this@MainActivity, p)
+                      setOnCheckedChangeListener { _, on ->
+                          AlarmScheduler.setEnabled(this@MainActivity, p, on)
+                          AlarmScheduler.schedule(this@MainActivity, p)
+                          if (on) {
+                              Toast.makeText(
+                                  this@MainActivity,
+                                  "${p.name} کا الارم آن ہو گیا",
+                                  Toast.LENGTH_SHORT
+                              ).show()
+                          }
+                      }
+                  })
+
+                  return row
+              }
+          }
+          FILE_END
+          mkdir -p app/src/main/java/com/example/namazalarm
+          cat > app/src/main/java/com/example/namazalarm/PrayerAlarmReceiver.kt <<'FILE_END'
+          package com.example.namazalarm
+
+          import android.app.NotificationChannel
+          import android.app.NotificationManager
+          import android.app.PendingIntent
+          import android.content.BroadcastReceiver
+          import android.content.Context
+          import android.content.Intent
+          import android.media.AudioAttributes
+          import android.media.RingtoneManager
+          import android.os.Build
+          import androidx.core.app.NotificationCompat
+
+          class PrayerAlarmReceiver : BroadcastReceiver() {
+
+              override fun onReceive(context: Context, intent: Intent) {
+                  val id = intent.getIntExtra("id", -1)
+                  val prayer = AlarmScheduler.prayers.firstOrNull { it.id == id } ?: return
+                  showNotification(context, prayer)
+                  // اگلے دن کے لیے دوبارہ الارم لگائیں
+                  AlarmScheduler.schedule(context, prayer)
+              }
+
+              companion object {
+                  private const val CHANNEL_ID = "namaz_alarm_channel_v2"
+
+                  fun showNotification(context: Context, prayer: Prayer) {
+                      val manager =
+                          context.getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+                      val sound = RingtoneManager.getDefaultUri(RingtoneManager.TYPE_ALARM)
+                          ?: RingtoneManager.getDefaultUri(RingtoneManager.TYPE_NOTIFICATION)
+
+                      if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
+                          val channel = NotificationChannel(
+                              CHANNEL_ID, "نماز الارم", NotificationManager.IMPORTANCE_HIGH
+                          ).apply {
+                              description = "نماز کے اوقات کی اطلاع"
+                              setSound(
+                                  sound,
+                                  AudioAttributes.Builder()
+                                      .setUsage(AudioAttributes.USAGE_ALARM)
+                                      .setContentType(AudioAttributes.CONTENT_TYPE_SONIFICATION)
+                                      .build()
+                              )
+                              enableVibration(true)
+                          }
+                          manager.createNotificationChannel(channel)
+                      }
+
+                      val open = PendingIntent.getActivity(
+                          context, 0, Intent(context, MainActivity::class.java),
+                          PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE
+                      )
+
+                      val notification = NotificationCompat.Builder(context, CHANNEL_ID)
+                          .setSmallIcon(android.R.drawable.ic_lock_idle_alarm)
+                          .setContentTitle("${prayer.name} کا وقت")
+                          .setContentText("نماز کا وقت ہو گیا ہے")
+                          .setPriority(NotificationCompat.PRIORITY_HIGH)
+                          .setCategory(NotificationCompat.CATEGORY_ALARM)
+                          .setSound(sound)
+                          .setVibrate(longArrayOf(0, 500, 300, 500))
+                          .setContentIntent(open)
+                          .setAutoCancel(true)
+                          .build()
+
+                      manager.notify(prayer.id, notification)
+                  }
+              }
+          }
+          FILE_END
+          cat > build.gradle.kts <<'FILE_END'
+          plugins {
+              id("com.android.application") version "8.5.2" apply false
+              id("org.jetbrains.kotlin.android") version "1.9.24" apply false
+          }
+          FILE_END
+          cat > gradle.properties <<'FILE_END'
+          org.gradle.jvmargs=-Xmx2048m -Dfile.encoding=UTF-8
+          android.useAndroidX=true
+          kotlin.code.style=official
+          FILE_END
+          cat > settings.gradle.kts <<'FILE_END'
+          pluginManagement {
+              repositories {
+                  google()
+                  mavenCentral()
+                  gradlePluginPortal()
+              }
+          }
+          dependencyResolutionManagement {
+              repositoriesMode.set(RepositoriesMode.FAIL_ON_PROJECT_REPOS)
+              repositories {
+                  google()
+                  mavenCentral()
+              }
+          }
+          rootProject.name = "NamazAlarm"
+          include(":app")
+          FILE_END
+
+      - name: Build debug APK
+        working-directory: NamazAlarm
+        run: gradle assembleDebug --no-daemon
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: NamazAlarm-APK
+          path: NamazAlarm/app/build/outputs/apk/debug/*.apk
+
+      - name: Upload source code
+        uses: actions/upload-artifact@v4
+        with:
+          name: NamazAlarm-source
+          path: |
+            NamazAlarm/app/src
+            NamazAlarm/*.kts
+            NamazAlarm/app/build.gradle.kts
+پیسٹ کے بعد commit سے پہلے چیک کریں کہ پہلی لائن name: Build APK ہے، اور نیچے اسکرول کرنے پر آخری لائن NamazAlarm/app/build.gradle.kts ہے۔ پھر Commit changes کر کے github.com/hafizmateen1423-alt/Namaz-Alarm-app/actions میں بلڈ دیکھیں اور اسکرین شاٹ بھیجیں۔
